@@ -394,6 +394,91 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
     }
 }
 
+const SIP_TINY_FILL: &[u8] = b"SIP/2.0 100 \r\n\r\n";
+const SIP_SMALL_FILLS: [&[u8]; 3] = [
+    b"SIP/2.0 100 Trying\r\n\r\n",
+    b"SIP/2.0 180 Ringing\r\n\r\n",
+    b"SIP/2.0 200 OK\r\n\r\n",
+];
+static SIP_FULL_PREFIXES: [&[u8]; 3] = [
+    b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: ",
+    b"SIP/2.0 180 Ringing\r\nVia: SIP/2.0/UDP pbx.example.net:5060;branch=z9hG4bK\r\nContent-Length: ",
+    b"SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP voip.example.org:5060;branch=z9hG4bK\r\nContent-Length: ",
+];
+
+fn select_sip_variant<'a>(fills: &'a [&'a [u8]], len: usize, seed: usize) -> Option<&'a [u8]> {
+    let candidates = fills.iter().filter(|fill| fill.len() <= len).count();
+    if candidates == 0 {
+        return None;
+    }
+
+    fills
+        .iter()
+        .copied()
+        .filter(|fill| fill.len() <= len)
+        .nth(seed % candidates)
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn sip_body_len_for_prefix(prefix: &[u8], len: usize) -> Option<usize> {
+    for digits in 1..=decimal_digits(len) {
+        let header_len = prefix.len() + digits + b"\r\n\r\n".len();
+        if header_len > len {
+            return None;
+        }
+
+        let body_len = len - header_len;
+        if decimal_digits(body_len) == digits {
+            return Some(body_len);
+        }
+    }
+
+    None
+}
+
+fn select_sip_header_variant<'a>(
+    prefixes: &'a [&'a [u8]],
+    len: usize,
+    seed: usize,
+) -> Option<&'a [u8]> {
+    let candidates = prefixes
+        .iter()
+        .filter(|prefix| sip_body_len_for_prefix(prefix, len).is_some())
+        .count();
+    if candidates == 0 {
+        return None;
+    }
+
+    prefixes
+        .iter()
+        .copied()
+        .filter(|prefix| sip_body_len_for_prefix(prefix, len).is_some())
+        .nth(seed % candidates)
+}
+
+fn write_sip_header_padding(padding: &mut [u8], prefix: &[u8]) {
+    let body_len = sip_body_len_for_prefix(prefix, padding.len())
+        .expect("selected SIP header prefix must fit padding");
+    let body_len_text = body_len.to_string();
+    let header_end = prefix.len() + body_len_text.len() + b"\r\n\r\n".len();
+
+    padding[..prefix.len()].copy_from_slice(prefix);
+    padding[prefix.len()..prefix.len() + body_len_text.len()]
+        .copy_from_slice(body_len_text.as_bytes());
+    padding[prefix.len() + body_len_text.len()..header_end].copy_from_slice(b"\r\n\r\n");
+    for b in padding[header_end..].iter_mut() {
+        *b = b' ';
+    }
+}
+
 /// SIP-style padding: SIP response status line + header continuation text.
 ///
 /// The padded packet is being emitted by the proxy *toward the client*, so it
@@ -406,47 +491,46 @@ fn apply_stun_padding(data: &mut [u8], pad_size: usize) {
 /// `SIP/2.0 ...` response line.
 ///
 /// The padding uses a complete SIP header block when it fits.  Mid-sized
-/// padding uses the smallest complete SIP response (`SIP/2.0 100 \r\n\r\n`,
-/// with an empty reason phrase) plus zero fill so it never exposes a partial
-/// header line. Padding shorter than that cannot contain a complete SIP
-/// response, so it falls back to a status-line fragment with a CRLF suffix.
+/// padding uses a small complete response with a reason phrase (`100 Trying`,
+/// `180 Ringing`, or `200 OK`) plus space fill so it never exposes a partial
+/// header line. Padding shorter than the tiny empty-reason response cannot
+/// contain a complete SIP response, so it falls back to a status-line fragment
+/// with a CRLF suffix.
 fn apply_sip_padding(data: &mut [u8], pad_size: usize) {
-    let padding = &mut data[..pad_size];
+    let (padding, payload) = data.split_at_mut(pad_size);
     if padding.is_empty() {
         return;
     }
 
     let len = padding.len();
-    const SIP_MIN_FILL: &[u8] = b"SIP/2.0 100 \r\n\r\n";
 
-    // SIP 100 Trying response with a realistic Via sent-by and Content-Length.
-    // Starts with the response status line so the directionality (server →
-    // client) matches what a DPI engine expects for traffic emitted by the
-    // proxy. `100 Trying` is the most common provisional response, never
-    // contains a body, and elicits no client retransmission.
-    //
-    // The sent-by uses a plausible hostname:port instead of the literal string
-    // "proxy", which would look obviously synthetic to any deep inspector.
-    static SIP_FILL: &[u8] =
-        b"SIP/2.0 100 Trying\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\nContent-Length: 0\r\n\r\n";
+    // Full variants use plausible sent-by hostnames and a Content-Length that
+    // matches the trailing space body, avoiding extraneous bytes after the SIP
+    // header block.
+    let seed = fnv1a_seed(payload) as usize;
+    if let Some(prefix) = select_sip_header_variant(&SIP_FULL_PREFIXES, len, seed) {
+        write_sip_header_padding(padding, prefix);
+        return;
+    }
 
-    let fill = if len >= SIP_FILL.len() {
-        SIP_FILL
-    } else if len >= SIP_MIN_FILL.len() {
-        SIP_MIN_FILL
+    let fill = if let Some(fill) = select_sip_variant(&SIP_SMALL_FILLS, len, seed) {
+        fill
+    } else if len >= SIP_TINY_FILL.len() {
+        SIP_TINY_FILL
     } else {
-        &SIP_FILL[..std::cmp::min(len, SIP_FILL.len())]
+        let variant = seed % SIP_SMALL_FILLS.len();
+        &SIP_SMALL_FILLS[variant][..std::cmp::min(len, SIP_SMALL_FILLS[variant].len())]
     };
 
     padding[..fill.len()].copy_from_slice(fill);
     for b in padding[fill.len()..].iter_mut() {
-        *b = 0x00;
+        *b = b' ';
     }
 
-    // Tiny padding cannot carry a complete SIP response (the smallest useful
-    // form is 16 bytes). Keep a CRLF suffix so it at least looks like a
-    // status-line fragment rather than a broken header block.
-    if len < SIP_MIN_FILL.len() && len >= 2 {
+    // Tiny padding cannot carry even the 16-byte empty-reason response. Keep a
+    // CRLF suffix so it at least looks like a status-line fragment rather than
+    // a broken header block.
+    if len < SIP_TINY_FILL.len() && len >= 2 {
         padding[len - 2] = b'\r';
         padding[len - 1] = b'\n';
     }
@@ -461,6 +545,46 @@ fn lcg_step(state: u32) -> u32 {
 mod tests {
     use super::*;
     use crate::config::HRange;
+
+    fn sip_response_fill(padding: &[u8]) -> Option<&'static [u8]> {
+        SIP_SMALL_FILLS
+            .iter()
+            .copied()
+            .find(|fill| padding.starts_with(fill))
+            .or_else(|| padding.starts_with(SIP_TINY_FILL).then_some(SIP_TINY_FILL))
+    }
+
+    fn sip_content_length_body_offset(padding: &[u8]) -> Option<(usize, usize)> {
+        let text = std::str::from_utf8(padding).ok()?;
+        let header_end = text.find("\r\n\r\n")? + b"\r\n\r\n".len();
+        let content_length = text
+            .split("\r\n")
+            .find_map(|line| line.strip_prefix("Content-Length: "))?
+            .parse::<usize>()
+            .ok()?;
+        Some((content_length, header_end))
+    }
+
+    fn assert_sip_response_padding(padding: &[u8]) {
+        if let Some((content_length, body_offset)) = sip_content_length_body_offset(padding) {
+            assert_eq!(
+                padding.len() - body_offset,
+                content_length,
+                "Content-Length should match the SIP padding body length"
+            );
+            assert!(
+                padding[body_offset..].iter().all(|&b| b == b' '),
+                "SIP padding body should be space-filled"
+            );
+            return;
+        }
+
+        let fill = sip_response_fill(padding).expect("padding starts with a compact SIP response");
+        assert!(
+            padding[fill.len()..].iter().all(|&b| b == b' '),
+            "SIP padding tail should be space-filled after the response prefix"
+        );
+    }
 
     // -- QUIC padding tests --
 
@@ -692,12 +816,36 @@ mod tests {
 
         // Padding starts with the SIP/2.0 response status line
         let padding = &data[..50];
-        assert!(padding.starts_with(b"SIP/2.0 100 "));
-        assert_eq!(&padding[..16], b"SIP/2.0 100 \r\n\r\n");
-        assert!(padding[16..].iter().all(|&b| b == 0x00));
+        assert_sip_response_padding(padding);
         assert!(!padding.windows(4).any(|w| w == b"\r\nVi"));
         // Payload untouched
         assert!(data[50..60].iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    fn sip_padding_variant_depends_on_payload() {
+        let mut seen = [false; 3];
+
+        for marker in 0u8..=u8::MAX {
+            let mut data = vec![0x00; 140];
+            data[120..140].fill(marker);
+            apply_padding(&mut data, 120, Protocol::Sip);
+
+            for (idx, prefix) in SIP_FULL_PREFIXES.iter().enumerate() {
+                if data[..120].starts_with(prefix) {
+                    seen[idx] = true;
+                }
+            }
+
+            if seen.iter().filter(|&&value| value).count() > 1 {
+                break;
+            }
+        }
+
+        assert!(
+            seen.iter().filter(|&&value| value).count() > 1,
+            "same-size SIP padding should vary across different payloads"
+        );
     }
 
     #[test]
@@ -708,9 +856,9 @@ mod tests {
 
         let padding = &data[..120];
         let text = std::str::from_utf8(padding).unwrap();
-        assert!(text.starts_with("SIP/2.0 100 Trying\r\n"));
-        assert!(text.contains("\r\nVia: SIP/2.0/UDP sip.example.com:5060;branch=z9hG4bK\r\n"));
-        assert!(text.contains("\r\nContent-Length: 0\r\n\r\n"));
+        assert_sip_response_padding(padding);
+        assert!(text.contains("\r\nVia: SIP/2.0/UDP "));
+        assert!(text.contains("\r\nContent-Length: "));
         assert!(data[120..140].iter().all(|&b| b == 0xCC));
     }
 
@@ -979,8 +1127,7 @@ mod tests {
         assert!(result);
 
         // Prefix padding should contain a complete minimal SIP response.
-        assert!(pkt[..20].starts_with(b"SIP/2.0 100 \r\n\r\n"));
-        assert!(pkt[16..20].iter().all(|&b| b == 0x00));
+        assert_sip_response_padding(&pkt[..20]);
         // Header + body should be untouched
         assert_eq!(&pkt[20..24], &750u32.to_le_bytes());
         assert!(pkt[24..124].iter().all(|&b| b == 0xBB));
