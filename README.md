@@ -1,3 +1,11 @@
+## 🚀 Quick Start for me
+
+```
+curl -O https://raw.githubusercontent.com/ekonyukov/amneziawg-install/main/amneziawg-install.sh
+chmod +x amneziawg-install.sh
+sudo AUTO_INSTALL=y ENABLE_IPV6=n SERVER_PORT=50228 ./amneziawg-install.sh
+```
+
 # AmneziaWG Installer
 
 Set up an [AmneziaWG](https://docs.amnezia.org/documentation/amnezia-wg/) obfuscated VPN on any supported Linux server in under 2 minutes — with an optional web panel and an optional traffic-obfuscation proxy.
