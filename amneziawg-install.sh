@@ -10,6 +10,7 @@ NC='\033[0m'
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
 WEB_PANEL_CONFIG_DIR="${AMNEZIAWG_DIR}/clients"
+SERVER_AWG_IPV4_PREFIX=16
 
 # Ensure sbin directories are in PATH for depmod, modprobe, sysctl, etc.
 # Some minimal or non-login root shells may not include these by default.
@@ -242,6 +243,162 @@ function isPrivateIPv4() {
 	# (RFC 1122 §3.2.1.3) as non-public, not just the single unspecified
 	# address 0.0.0.0, since none of these are routable on the public internet.
 	if (( A == 0 )); then return 0; fi
+
+	return 1
+}
+
+function ipv4ToInt() {
+	local ADDR="${1:-}"
+	if ! [[ "${ADDR}" =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; then
+		return 1
+	fi
+
+	local A B C D REST
+	A=$((10#${ADDR%%.*}))
+	REST="${ADDR#*.}"
+	B=$((10#${REST%%.*}))
+	REST="${REST#*.}"
+	C=$((10#${REST%%.*}))
+	D=$((10#${REST#*.}))
+
+	echo $(((A << 24) + (B << 16) + (C << 8) + D))
+}
+
+function intToIPv4() {
+	local IP_INT=$1
+	if ! [[ "${IP_INT}" =~ ^[0-9]+$ ]] || (( IP_INT < 0 || IP_INT > 4294967295 )); then
+		return 1
+	fi
+
+	echo "$(((IP_INT >> 24) & 255)).$(((IP_INT >> 16) & 255)).$(((IP_INT >> 8) & 255)).$((IP_INT & 255))"
+}
+
+function ipv4NetworkBaseInt() {
+	local ADDR="$1"
+	local PREFIX="${2:-${SERVER_AWG_IPV4_PREFIX}}"
+	local IP_INT MASK
+
+	IP_INT=$(ipv4ToInt "${ADDR}") || return 1
+	if ! [[ "${PREFIX}" =~ ^[0-9]+$ ]] || (( PREFIX < 0 || PREFIX > 32 )); then
+		return 1
+	fi
+
+	if (( PREFIX == 0 )); then
+		MASK=0
+	else
+		MASK=$(( (0xFFFFFFFF << (32 - PREFIX)) & 0xFFFFFFFF ))
+	fi
+
+	echo $((IP_INT & MASK))
+}
+
+function ipv4BroadcastInt() {
+	local ADDR="$1"
+	local PREFIX="${2:-${SERVER_AWG_IPV4_PREFIX}}"
+	local NETWORK_INT HOST_MASK
+
+	NETWORK_INT=$(ipv4NetworkBaseInt "${ADDR}" "${PREFIX}") || return 1
+	if ! [[ "${PREFIX}" =~ ^[0-9]+$ ]] || (( PREFIX < 0 || PREFIX > 32 )); then
+		return 1
+	fi
+
+	if (( PREFIX == 32 )); then
+		HOST_MASK=0
+	else
+		HOST_MASK=$(( (1 << (32 - PREFIX)) - 1 ))
+	fi
+
+	echo $((NETWORK_INT | HOST_MASK))
+}
+
+function ipv4InServerSubnet() {
+	local ADDR="$1"
+	local SERVER_NETWORK ADDR_NETWORK
+
+	SERVER_NETWORK=$(ipv4NetworkBaseInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+	ADDR_NETWORK=$(ipv4NetworkBaseInt "${ADDR}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+
+	[[ "${ADDR_NETWORK}" == "${SERVER_NETWORK}" ]]
+}
+
+function ipv4IsUsableClientAddress() {
+	local ADDR="$1"
+	local ADDR_INT SERVER_INT NETWORK_INT BROADCAST_INT
+
+	ADDR_INT=$(ipv4ToInt "${ADDR}") || return 1
+	SERVER_INT=$(ipv4ToInt "${SERVER_AWG_IPV4}") || return 1
+	NETWORK_INT=$(ipv4NetworkBaseInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+	BROADCAST_INT=$(ipv4BroadcastInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+
+	ipv4InServerSubnet "${ADDR}" \
+		&& (( ADDR_INT != SERVER_INT )) \
+		&& (( ADDR_INT != NETWORK_INT )) \
+		&& (( ADDR_INT != BROADCAST_INT ))
+}
+
+function clientIPv6ForIPv4() {
+	local CLIENT_IPV4="$1"
+	local NORMALIZED_SERVER_IPV6 BASE_IPV6 NETWORK_INT CLIENT_INT CLIENT_OFFSET CLIENT_HEX
+
+	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}") || return 1
+	BASE_IPV6=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+	NETWORK_INT=$(ipv4NetworkBaseInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+	CLIENT_INT=$(ipv4ToInt "${CLIENT_IPV4}") || return 1
+	CLIENT_OFFSET=$((CLIENT_INT - NETWORK_INT))
+	if (( CLIENT_OFFSET < 1 || CLIENT_OFFSET > 65535 )); then
+		return 1
+	fi
+	printf -v CLIENT_HEX '%x' "${CLIENT_OFFSET}"
+	normalizeIPv6 "${BASE_IPV6}::${CLIENT_HEX}"
+}
+
+function ipv6ClientAddressExists() {
+	local CLIENT_IPV6="$1"
+	local EXISTING_IPV6_RAW
+
+	while IFS= read -r EXISTING_IPV6_RAW; do
+		if [[ "$(normalizeIPv6 "${EXISTING_IPV6_RAW%/128}")" == "${CLIENT_IPV6}" ]]; then
+			return 0
+		fi
+	done < <(grep -oE '[a-fA-F0-9:]+/128' "${SERVER_AWG_CONF}")
+
+	return 1
+}
+
+function firstFreeClientIPv4() {
+	local SERVER_INT NETWORK_INT BROADCAST_INT CANDIDATE_INT CANDIDATE_IP IPV4_EXISTS CLIENT_IPV6_CANDIDATE
+
+	SERVER_INT=$(ipv4ToInt "${SERVER_AWG_IPV4}") || return 1
+	NETWORK_INT=$(ipv4NetworkBaseInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+	BROADCAST_INT=$(ipv4BroadcastInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}") || return 1
+
+	for (( CANDIDATE_INT = SERVER_INT + 1; CANDIDATE_INT < BROADCAST_INT; CANDIDATE_INT++ )); do
+		(( CANDIDATE_INT == NETWORK_INT || CANDIDATE_INT == SERVER_INT )) && continue
+		CANDIDATE_IP=$(intToIPv4 "${CANDIDATE_INT}") || continue
+		IPV4_EXISTS=$(grep -cF "${CANDIDATE_IP}/32" "${SERVER_AWG_CONF}")
+		if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
+			CLIENT_IPV6_CANDIDATE=$(clientIPv6ForIPv4 "${CANDIDATE_IP}") || continue
+			ipv6ClientAddressExists "${CLIENT_IPV6_CANDIDATE}" && continue
+		fi
+		if [[ ${IPV4_EXISTS} == '0' ]]; then
+			echo "${CANDIDATE_IP}"
+			return 0
+		fi
+	done
+
+	for (( CANDIDATE_INT = NETWORK_INT + 1; CANDIDATE_INT < SERVER_INT; CANDIDATE_INT++ )); do
+		(( CANDIDATE_INT == NETWORK_INT )) && continue
+		CANDIDATE_IP=$(intToIPv4 "${CANDIDATE_INT}") || continue
+		IPV4_EXISTS=$(grep -cF "${CANDIDATE_IP}/32" "${SERVER_AWG_CONF}")
+		if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
+			CLIENT_IPV6_CANDIDATE=$(clientIPv6ForIPv4 "${CANDIDATE_IP}") || continue
+			ipv6ClientAddressExists "${CLIENT_IPV6_CANDIDATE}" && continue
+		fi
+		if [[ ${IPV4_EXISTS} == '0' ]]; then
+			echo "${CANDIDATE_IP}"
+			return 0
+		fi
+	done
 
 	return 1
 }
@@ -1716,15 +1873,15 @@ function installQuestions() {
 function writeFirewallRules() {
 	if systemctl is-active --quiet firewalld 2>/dev/null; then
 		local FIREWALLD_IPV4_ADDRESS FIREWALLD_IPV6_ADDRESS FW_PU_V6="" FW_PD_V6=""
-		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_AWG_IPV4}" | cut -d"." -f1-3)".0"
+		FIREWALLD_IPV4_ADDRESS=$(intToIPv4 "$(ipv4NetworkBaseInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}")")
 		if [[ "${ENABLE_IPV6:-y}" == "y" ]]; then
 			# Derive /64 network address from the normalized IPv6 (first 4 groups + :0:0:0:0)
 			FIREWALLD_IPV6_ADDRESS="$(echo "${SERVER_AWG_IPV6}" | cut -d':' -f1-4):0:0:0:0"
 			FW_PU_V6=" && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'"
 			FW_PD_V6=" && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/64 masquerade'"
 		fi
-		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade'${FW_PU_V6}
-PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade'${FW_PD_V6}"
+		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/${SERVER_AWG_IPV4_PREFIX} masquerade'${FW_PU_V6}
+PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/${SERVER_AWG_IPV4_PREFIX} masquerade'${FW_PD_V6}"
 	elif command -v nft >/dev/null 2>&1 && { ! command -v iptables >/dev/null 2>&1 || iptables --version 2>/dev/null | grep -qi 'nf_tables'; }; then
 		# A single inet table covers both IPv4 and IPv6; the nat chain masquerades
 		# both families. PostDown drops the whole table atomically, so no per-rule
@@ -2008,7 +2165,7 @@ function installAmneziaWG() {
 	chmod 600 "${AMNEZIAWG_DIR}/params"
 
 	# Add server interface. Include the IPv6 address only when IPv6 is enabled.
-	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
+	local SERVER_ADDRESS="${SERVER_AWG_IPV4}/${SERVER_AWG_IPV4_PREFIX}"
 	if [[ "${ENABLE_IPV6}" == "y" ]]; then
 		SERVER_ADDRESS="${SERVER_ADDRESS},${SERVER_AWG_IPV6}/64"
 	fi
@@ -2145,6 +2302,7 @@ function newClient() {
 	local DOT_IP=""
 	local DOT_EXISTS=""
 	local BASE_IP=""
+	local FREE_CLIENT_IPV4=""
 
 	# If SERVER_PUB_IP is IPv6, normalize brackets
 	if [[ ${SERVER_PUB_IP} =~ .*:.* ]]; then
@@ -2154,46 +2312,14 @@ function newClient() {
 	fi
 	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
 
-	BASE_IP=$(echo "$SERVER_AWG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
-
 	# Precompute normalized server IPv6 and base prefix once, since SERVER_AWG_IPV6 is constant here.
 	local NORMALIZED_SERVER_IPV6 BASE_IPV6
 	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 	BASE_IPV6=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
 
-	local FREE_DOT_IP_FOUND=0
-	for DOT_IP in {2..254}; do
-		# Check IPv4 address "${BASE_IP}.${DOT_IP}/32" is not already in use
-		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
-
-		# Derive the would-be IPv6 client address in the same way as in AUTO_INSTALL
-		# and ensure the corresponding /128 is also not already present.
-		local CLIENT_IPV6_CANDIDATE
-		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
-
-		# Perform a semantic duplicate check: normalize existing /128 IPv6 addresses
-		# before comparing, so compressed vs expanded forms are treated as equal.
-		IPV6_EXISTS=0
-		while IFS= read -r _existing_ip_cidr; do
-			# Strip the /128 suffix to get the raw IPv6 address
-			local _existing_ip="${_existing_ip_cidr%/*}"
-			local _normalized_existing
-			_normalized_existing=$(normalizeIPv6 "${_existing_ip}")
-			if [[ "${_normalized_existing}" == "${CLIENT_IPV6_CANDIDATE}" ]]; then
-				IPV6_EXISTS=1
-				break
-			fi
-		done < <(grep -oE '([0-9a-fA-F:]+)/128' "${SERVER_AWG_CONF}")
-
-		if [[ ${DOT_EXISTS} == '0' && ${IPV6_EXISTS} == '0' ]]; then
-			FREE_DOT_IP_FOUND=1
-			break
-		fi
-	done
-
-	if [[ ${FREE_DOT_IP_FOUND} -eq 0 ]]; then
+	if ! FREE_CLIENT_IPV4=$(firstFreeClientIPv4); then
 		echo ""
-		echo "The subnet configured supports only 253 clients."
+		echo "The ${SERVER_AWG_IPV4}/${SERVER_AWG_IPV4_PREFIX} subnet has no free client IPv4 addresses."
 		exit 1
 	fi
 
@@ -2206,12 +2332,8 @@ function newClient() {
 			CLIENT_NUM=$((CLIENT_NUM + 1))
 		done
 
-		CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
-
-		local NORMALIZED_SERVER_IPV6 BASE_IPV6_PREFIX
-		NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
-		BASE_IPV6_PREFIX=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
-		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6_PREFIX}::${DOT_IP}")
+		CLIENT_AWG_IPV4="${FREE_CLIENT_IPV4}"
+		CLIENT_AWG_IPV6=$(clientIPv6ForIPv4 "${CLIENT_AWG_IPV4}")
 	else
 		echo ""
 		echo "Client configuration"
@@ -2230,18 +2352,16 @@ function newClient() {
 		done
 
 		until [[ ${IPV4_EXISTS} == '0' ]]; do
-			read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
+			read -rp "Client AmneziaWG IPv4: " -e -i "${FREE_CLIENT_IPV4}" CLIENT_AWG_IPV4
 
-			# Validate host number is between 2 and 254
-			if ! [[ ${DOT_IP} =~ ^[0-9]+$ ]] || (( DOT_IP < 2 )) || (( DOT_IP > 254 )); then
+			if ! ipv4IsUsableClientAddress "${CLIENT_AWG_IPV4}"; then
 				echo ""
-				echo -e "${ORANGE}Invalid host number. Must be between 2 and 254.${NC}"
+				echo -e "${ORANGE}Invalid IPv4. Use a free address inside ${SERVER_AWG_IPV4}/${SERVER_AWG_IPV4_PREFIX}, excluding the server, network, and broadcast addresses.${NC}"
 				echo ""
 				IPV4_EXISTS='1'
 				continue
 			fi
 
-			CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
 			IPV4_EXISTS=$(grep -cF "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
 
 			if [[ ${IPV4_EXISTS} != 0 ]]; then
@@ -2259,6 +2379,10 @@ function newClient() {
 			local NORMALIZED_SERVER_IPV6
 			NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
 			BASE_IP=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
+			local CLIENT_IPV4_INT NETWORK_IPV4_INT DEFAULT_IPV6_HOST
+			CLIENT_IPV4_INT=$(ipv4ToInt "${CLIENT_AWG_IPV4}")
+			NETWORK_IPV4_INT=$(ipv4NetworkBaseInt "${SERVER_AWG_IPV4}" "${SERVER_AWG_IPV4_PREFIX}")
+			printf -v DEFAULT_IPV6_HOST '%x' "$((CLIENT_IPV4_INT - NETWORK_IPV4_INT))"
 
 			# Reset IPV6_EXISTS so the until-loop below actually prompts the user.
 			# The free-IP search loop above already set it to '0' for the first
@@ -2267,7 +2391,7 @@ function newClient() {
 			IPV6_EXISTS=""
 
 			until [[ ${IPV6_EXISTS} == '0' ]]; do
-				read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
+				read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DEFAULT_IPV6_HOST}" DOT_IP
 
 				# Validate IPv6 host part is a valid hex segment (1-4 hex characters)
 				if ! [[ ${DOT_IP} =~ ^[a-fA-F0-9]{1,4}$ ]]; then
@@ -2302,7 +2426,7 @@ function newClient() {
 	# prompt was unexpectedly skipped), derive it from the server's /64 prefix
 	# and the selected host number to avoid writing a broken config.
 	if [[ -z "${CLIENT_AWG_IPV6}" ]]; then
-		CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+		CLIENT_AWG_IPV6=$(clientIPv6ForIPv4 "${CLIENT_AWG_IPV4}")
 	fi
 
 	# Generate key pair for the client
@@ -3637,42 +3761,14 @@ function nonInteractiveAddClient() {
 		exit 1
 	fi
 
-	# Auto-assign the first available IP pair (same logic as AUTO_INSTALL)
-	local BASE_IP DOT_IP DOT_EXISTS IPV6_EXISTS CLIENT_AWG_IPV4 CLIENT_AWG_IPV6
-	BASE_IP="${SERVER_AWG_IPV4%.*}"
-
-	local NORMALIZED_SERVER_IPV6 BASE_IPV6
-	NORMALIZED_SERVER_IPV6=$(normalizeIPv6 "${SERVER_AWG_IPV6}")
-	BASE_IPV6=$(echo "${NORMALIZED_SERVER_IPV6}" | cut -d':' -f1-4)
-
-	local FREE_FOUND=0
-	for DOT_IP in {2..254}; do
-		DOT_EXISTS=$(grep -cF "${BASE_IP}.${DOT_IP}/32" "${SERVER_AWG_CONF}")
-		local CLIENT_IPV6_CANDIDATE
-		CLIENT_IPV6_CANDIDATE=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
-		IPV6_EXISTS=0
-		while IFS= read -r _existing_ip_cidr; do
-			local _existing_ip="${_existing_ip_cidr%/*}"
-			local _normalized_existing
-			_normalized_existing=$(normalizeIPv6 "${_existing_ip}")
-			if [[ "${_normalized_existing}" == "${CLIENT_IPV6_CANDIDATE}" ]]; then
-				IPV6_EXISTS=1
-				break
-			fi
-		done < <(grep -oE '([0-9a-fA-F:]+)/128' "${SERVER_AWG_CONF}")
-		if [[ ${DOT_EXISTS} == '0' && ${IPV6_EXISTS} == '0' ]]; then
-			FREE_FOUND=1
-			break
-		fi
-	done
-
-	if [[ ${FREE_FOUND} -eq 0 ]]; then
-		echo "ERROR: no free IP addresses available (max 253 clients)" >&2
+	# Auto-assign the first available IP pair inside the configured /16.
+	local CLIENT_AWG_IPV4 CLIENT_AWG_IPV6
+	if ! CLIENT_AWG_IPV4=$(firstFreeClientIPv4); then
+		echo "ERROR: no free IP addresses available in ${SERVER_AWG_IPV4}/${SERVER_AWG_IPV4_PREFIX}" >&2
 		exit 1
 	fi
 
-	CLIENT_AWG_IPV4="${BASE_IP}.${DOT_IP}"
-	CLIENT_AWG_IPV6=$(normalizeIPv6 "${BASE_IPV6}::${DOT_IP}")
+	CLIENT_AWG_IPV6=$(clientIPv6ForIPv4 "${CLIENT_AWG_IPV4}")
 
 	# Generate key pair
 	local CLIENT_PRIV_KEY CLIENT_PUB_KEY CLIENT_PRE_SHARED_KEY
